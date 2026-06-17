@@ -1,4 +1,5 @@
 import json
+import re
 import secrets
 from pathlib import Path
 
@@ -177,6 +178,7 @@ class MsgForward(star.Star):
             "#mf hide <编号>   切换规则来源信息显示/隐藏\n"
             "#mf hidelist      列出当前会话规则的来源信息状态\n"
             "#mf hidelistall   列出所有规则的来源信息状态\n"
+            "#mf filter        查看当前过滤配置\n"
             "#mf help          显示此帮助"
         )
 
@@ -389,6 +391,107 @@ class MsgForward(star.Star):
             )
         yield event.plain_result("\n".join(lines))
 
+    @mf.command("filter")
+    async def cmd_filter_list(self, event: AstrMessageEvent):
+        """查看当前的过滤配置"""
+        filter_mode = self.config.get("filter_mode", "off")
+        patterns_data = MsgForward._unwrap_patterns(self.config.get("filter_patterns"))
+
+        mode_text = {"off": "关闭", "blacklist": "黑名单", "whitelist": "白名单"}.get(filter_mode, filter_mode)
+        lines = [f"📋 全局过滤：{mode_text}" + (f"（共 {len(patterns_data)} 条）" if patterns_data else "")]
+
+        if filter_mode == "off":
+            lines.append("      （关闭，未启用过滤）")
+        elif not patterns_data:
+            lines.append(f"      （已启用但未配置过滤规则）")
+        else:
+            for i, item in enumerate(patterns_data, start=1):
+                tp, val = MsgForward._parse_filter_item(item)
+                tag = "[正]" if tp == "regex" else "[关]"
+                lines.append(f"      {tag} {i}. {val}")
+
+        # 显示各规则的单独过滤配置
+        rules = self.config.get("rules", [])
+        has_per_rule = False
+        for idx, r in enumerate(rules, start=1):
+            rfm = r.get("filter_mode", "inherit")
+            rfp = r.get("filter_patterns", [])
+            if rfm != "inherit" or (rfp and len(rfp) > 0):
+                if not has_per_rule:
+                    lines.append(f"\n📋 规则级过滤（共 {len(rules)} 条规则）：")
+                    has_per_rule = True
+                rm_text = {"off": "关闭", "blacklist": "黑名单", "whitelist": "白名单"}.get(rfm, "继承全局") if rfm != "inherit" else "继承全局"
+                lines.append(f"  #{idx} | {r.get('source_umo','?')} → {r.get('target_umo','?')} | {rm_text}")
+                if rfp:
+                    for j, item in enumerate(rfp, start=1):
+                        tp, val = MsgForward._parse_filter_item(str(item))
+                        tag = "[正]" if tp == "regex" else "[关]"
+                        lines.append(f"      {tag} {j}. {val}")
+
+        if not has_per_rule:
+            lines.append("（所有规则使用全局过滤配置）")
+
+        yield event.plain_result("\n".join(lines))
+
+    def _should_forward(self, event: AstrMessageEvent, rule: dict = None) -> bool:
+        """根据过滤规则判断是否应该转发此消息，优先使用规则级配置"""
+        # 确定生效的过滤模式和规则列表
+        if rule:
+            fm = rule.get("filter_mode", "inherit")
+            if fm == "inherit":
+                fm = self.config.get("filter_mode", "off")
+            rfp = rule.get("filter_patterns")
+            if rfp and len(rfp) > 0:
+                fp = rfp
+            else:
+                fp = MsgForward._unwrap_patterns(self.config.get("filter_patterns"))
+        else:
+            fm = self.config.get("filter_mode", "off")
+            fp = MsgForward._unwrap_patterns(self.config.get("filter_patterns"))
+
+        if fm == "off":
+            return True
+
+        fp = [x.strip() for x in fp if x.strip()]
+        if not fp:
+            return True
+
+        msg_text = event.message_str
+        msg_lower = msg_text.lower()
+
+        for item in fp:
+            item_type, item_val = self._parse_filter_item(item)
+            if not item_val:
+                continue
+            if item_type == "keyword":
+                if item_val.lower() in msg_lower:
+                    return fm == "whitelist"
+            else:
+                if re.search(item_val, msg_text):
+                    return fm == "whitelist"
+
+        return fm == "blacklist"
+
+    @staticmethod
+    def _parse_filter_item(item: str):
+        """解析一条过滤规则，返回 (type, value)"""
+        s = item.strip()
+        if s.startswith("regex:"):
+            return "regex", s[6:].strip()
+        return "keyword", s
+
+    @staticmethod
+    def _unwrap_patterns(patterns):
+        """将全局 filter_patterns 统一转为字符串列表（兼容 text 和 template_list 格式）"""
+        if not patterns:
+            return []
+        if isinstance(patterns, str):
+            return [x.strip() for x in patterns.splitlines() if x.strip()]
+        if isinstance(patterns, list):
+            return [item.get("rule", "").strip() for item in patterns
+                    if isinstance(item, dict) and item.get("rule", "").strip()]
+        return []
+
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def forward_message(self, event: AstrMessageEvent):
         """主转发逻辑"""
@@ -403,6 +506,9 @@ class MsgForward(star.Star):
             for rule in rules:
                 target = rule.get("target_umo")
                 if not target:
+                    continue
+                # 逐规则过滤检查
+                if not self._should_forward(event, rule):
                     continue
                 try:
                     if rule.get("hide_header", False):

@@ -34,6 +34,19 @@
             "type": "bool",
             "hint": "开启后转发时不显示来源信息头，消息直接透传。",
             "default": false
+          },
+          "filter_mode": {
+            "description": "过滤模式",
+            "type": "string",
+            "hint": "仅对本规则生效。inherit=继承全局设置；off=不过滤；blacklist=黑名单；whitelist=白名单。",
+            "default": "inherit",
+            "options": ["inherit", "off", "blacklist", "whitelist"]
+          },
+          "filter_patterns": {
+            "description": "过滤规则列表（留空=继承全局设置）",
+            "type": "list",
+            "hint": "仅对本规则生效。每项格式：regex:正则表达式 或 关键词（默认）。如 regex:http 匹配含 http 的消息，广告 匹配含\"广告\"的消息（不区分大小写）",
+            "default": []
           }
         }
       }
@@ -77,5 +90,18 @@
     "type": "text",
     "hint": "可用变量：{sender_name} 发送者昵称、{sender_id} 发送者ID、{platform} 平台名、{msg_type} 消息类型、{conversation_id} 会话ID。留空则使用默认格式。注意：消息头末尾会自动追加换行。",
     "default": "[转发] {sender_name} ({sender_id})\n来自 {platform} 的 {msg_type}（ID: {conversation_id}）消息"
+  },
+  "filter_mode": {
+    "description": "消息过滤模式",
+    "type": "string",
+    "hint": "off=不过滤；blacklist=黑名单；whitelist=白名单。",
+    "default": "off",
+    "options": ["off", "blacklist", "whitelist"]
+  },
+  "filter_patterns": {
+    "description": "全局过滤规则列表（每行一条）",
+    "type": "text",
+    "hint": "每行一条过滤规则。regex:正则表达式 表示正则匹配，其余为关键词匹配（不区分大小写）。可全选复制粘贴批量增删。",
+    "default": ""
   }
 }
