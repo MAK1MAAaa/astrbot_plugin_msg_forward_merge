@@ -115,7 +115,7 @@ class MsgTransferStore:
     def save_rules(self, data: dict):
         save_json(self.rule_file, data)
 
-    def add_rule(self, source_umo: str, target_umo: str) -> str:
+    def add_rule(self, source_umo: str, target_umo: str, hide_header: bool = False) -> str:
         data = self.load_rules()
 
         # 查重
@@ -126,7 +126,8 @@ class MsgTransferStore:
         new_id = str(max(map(int, data.keys()), default=0) + 1)
         data[new_id] = {
             "source_umo": source_umo,
-            "target_umo": target_umo
+            "target_umo": target_umo,
+            "hide_header": hide_header
         }
         self.save_rules(data)
         return new_id
@@ -138,9 +139,19 @@ class MsgTransferStore:
         data.pop(rid)
         self.save_rules(data)
 
+    def set_hide_header(self, rid: str, hide: bool):
+        data = self.load_rules()
+        if rid not in data:
+            raise KeyError("规则不存在")
+        data[rid]["hide_header"] = hide
+        self.save_rules(data)
+
     def list_rules(self, source_umo):
         data = self.load_rules()
         return {rid: r for rid, r in data.items() if r["source_umo"] == source_umo}
+
+    def list_all_rules(self):
+        return self.load_rules()
 
     # ----- pending -----
     def load_pending(self):
@@ -230,7 +241,53 @@ class MsgTransfer(star.Star):
 
         lines = [f"📜 当前会话({source_umo}) 的规则："]
         for rid, r in rules.items():
-            lines.append(f"#{rid} {r['source_umo']} → {r['target_umo']}")
+            hide_status = "🔒" if r.get("hide_header", False) else "🔓"
+            lines.append(f"#{rid} {r['source_umo']} → {r['target_umo']} {hide_status}")
+        yield event.plain_result("\n".join(lines))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @mt.command("hide")
+    async def cmd_hide_header(self, event: AstrMessageEvent, rid: str):
+        """切换规则的来源信息显示状态（隐藏/显示）"""
+        try:
+            data = self.store.load_rules()
+            if rid not in data:
+                yield event.plain_result(f"❌ 规则 #{rid} 不存在")
+                return
+
+            current = data.get(rid, {}).get("hide_header", False)
+            self.store.set_hide_header(rid, not current)
+            status = "隐藏" if not current else "显示"
+            yield event.plain_result(f"✅ 规则 #{rid} 来源信息已{status}")
+        except Exception as e:
+            yield event.plain_result(f"❌ 操作失败：{e}")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @mt.command("header")
+    async def cmd_header_status(self, event: AstrMessageEvent):
+        """查看所有规则的来源信息显示状态（允许：显示来源，禁止：隐藏来源）"""
+        all_rules = self.store.list_all_rules()
+        if not all_rules:
+            yield event.plain_result("📭 暂无规则")
+            return
+
+        allowed = []
+        blocked = []
+
+        for rid, r in all_rules.items():
+            if r.get("hide_header", False):
+                blocked.append(f"#{rid} {r['source_umo']} → {r['target_umo']}")
+            else:
+                allowed.append(f"#{rid} {r['source_umo']} → {r['target_umo']}")
+
+        lines = ["📋 规则来源信息状态列表："]
+        if allowed:
+            lines.append("\n✅ 允许显示来源：")
+            lines.extend(allowed)
+        if blocked:
+            lines.append("\n🔒 禁止显示来源：")
+            lines.extend(blocked)
+
         yield event.plain_result("\n".join(lines))
 
     @filter.event_message_type(filter.EventMessageType.ALL)
@@ -247,10 +304,12 @@ class MsgTransfer(star.Star):
             for rid, rule in rules.items():
                 target = rule["target_umo"]
                 try:
-                    header = format_origin_header(event, source_umo)
-                    header += "\n\n\u200b"
-
-                    new_chain = list[BaseMessageComponent]([Plain(text=header)]) + message_chain
+                    if rule.get("hide_header", False):
+                        new_chain = message_chain
+                    else:
+                        header = format_origin_header(event, source_umo)
+                        header += "\n\n\u200b"
+                        new_chain = list[BaseMessageComponent]([Plain(text=header)]) + message_chain
                     await self.context.send_message(target, event.chain_result(new_chain))
                 except ValueError as e:
                     logger.error(f"❌ 不合法的 session 字符串，转发失败 #{rid}: {e}")
