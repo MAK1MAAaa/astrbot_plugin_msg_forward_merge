@@ -4,3 +4,8 @@ desc: 一个用于在不同聊天平台及群聊之间转发与同步消息的 A
 version: v0.2.0 # 插件版本号。格式：v1.1.1 或者 v1.1
 author: XTsat # 作者
 repo: https://github.com/XTsat/astrbot_plugin_msg_forward_cc # 插件的仓库地址
+support_platforms: # 支持的消息平台
+  - aiocqhttp
+  - wechatpadpro
+  - telegram
+  - discord
