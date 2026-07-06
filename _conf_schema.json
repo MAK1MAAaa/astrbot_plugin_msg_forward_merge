@@ -121,5 +121,11 @@
     "type": "int",
     "hint": "新建转发规则时的默认冷却间隔。转发一次后在该秒数内不再重复转发同一规则。每条规则可单独覆盖。",
     "default": 0
+  },
+  "download_media_before_send": {
+    "description": "发送媒体前先下载到本地",
+    "type": "bool",
+    "hint": "正常不用开，跨设备转发提示找不到文件时再启用。开启后转发前会先把媒体存到本地再转发。",
+    "default": false
   }
 }

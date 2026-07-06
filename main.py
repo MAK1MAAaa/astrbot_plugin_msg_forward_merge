@@ -12,12 +12,55 @@ from astrbot.api import AstrBotConfig
 
 import string
 
-from astrbot.core.message.components import Plain
+from astrbot.core.message.components import Plain, Image, Record, Video, File
 
 
 # ------------------------
 # 工具与数据路径
 # ------------------------
+
+
+async def _rebuild_media_component(comp):
+    """把媒体组件重新下载到本进程临时目录并以 fromFileSystem 重建。
+
+    解决跨会话转发时，组件内嵌的 file/cover 是源端临时路径、目标端不可达，导致 ENOENT / FileNotFoundError 的问题。失败时退化为 Plain 占位文本。"""
+    try:
+        local_path = await comp.convert_to_file_path()
+        if not local_path:
+            return comp
+        if isinstance(comp, Image):
+            return Image.fromFileSystem(local_path)
+        if isinstance(comp, Record):
+            return Record.fromFileSystem(local_path)
+        if isinstance(comp, Video):
+            # 清空 cover：源端封面通常是源平台临时路径，跨进程不可达
+            return Video.fromFileSystem(local_path)
+        if isinstance(comp, File):
+            # 保留原文件名（如存在），方便目标平台显示
+            name = getattr(comp, "name", None) or ""
+            try:
+                return File.fromFileSystem(local_path, name=name) if name else File.fromFileSystem(local_path)
+            except TypeError:
+                # 旧版本 File.fromFileSystem 不接受 name 关键字
+                return File.fromFileSystem(local_path)
+        return comp
+    except Exception as e:
+        comp_type = getattr(getattr(comp, "type", None), "value", None) or type(comp).__name__
+        logger.warning(f"⚠️ 转发时重下载媒体失败（{comp_type}），将以占位文本代替：{e}")
+        return Plain(text=f"[{comp_type}转发失败：源文件不可达]")
+
+
+async def _prepare_chain_for_forward(chain):
+    """转发前对消息链做「本地化」预处理，返回新的可安全跨会话发送的链。"""
+    if not chain:
+        return chain
+    prepared = []
+    for comp in chain:
+        if isinstance(comp, (Image, Record, Video, File)):
+            prepared.append(await _rebuild_media_component(comp))
+        else:
+            prepared.append(comp)
+    return prepared
 
 
 def load_json(path: Path) -> dict:
@@ -550,7 +593,12 @@ class MsgForward(star.Star):
             if not rules:
                 return
 
-            message_chain = event.get_messages()
+            raw_chain = event.get_messages()
+            # 跨设备转发时媒体组件的 file 路径常不可达，启用此选项会先下载到本机再转发。
+            if self.config.get("download_media_before_send", False):
+                message_chain = await _prepare_chain_for_forward(raw_chain)
+            else:
+                message_chain = raw_chain
             now = time.time()
 
             for idx, rule in enumerate(rules):
