@@ -3,6 +3,7 @@ import json
 import re
 import secrets
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
@@ -14,7 +15,16 @@ from astrbot.api import AstrBotConfig
 
 import string
 
-from astrbot.core.message.components import Plain, Image, Record, Video, File
+from astrbot.core.message.components import File, Image, Node, Nodes, Plain, Record, Video
+
+
+@dataclass
+class BufferedForward:
+    """等待合并发送的一条消息。"""
+
+    event: AstrMessageEvent
+    fallback_chain: list[Any]
+    node_content: list[Any]
 
 
 # ------------------------
@@ -22,11 +32,18 @@ from astrbot.core.message.components import Plain, Image, Record, Video, File
 # ------------------------
 
 
-async def _rebuild_media_component(comp):
-    """把媒体组件重新下载到本进程临时目录并以 fromFileSystem 重建。
+async def _rebuild_media_component(comp, freeze_for_delayed_send: bool = False):
+    """重建媒体组件；延迟发送时将图片和语音固化为 Base64。
 
-    解决跨会话转发时，组件内嵌的 file/cover 是源端临时路径、目标端不可达，导致 ENOENT / FileNotFoundError 的问题。失败时退化为 Plain 占位文本。"""
+    解决跨会话转发时，组件内嵌的 file/cover 是源端临时路径、目标端不可达，导致 ENOENT / FileNotFoundError 的问题。
+    合并转发会在事件结束后发送，AstrBot 可能已清理原始临时文件，因此图片和语音必须在事件仍有效时读取并内联保存。失败时退化为 Plain 占位文本。"""
     try:
+        if freeze_for_delayed_send:
+            if isinstance(comp, Image):
+                return Image.fromBase64(await comp.convert_to_base64())
+            if isinstance(comp, Record):
+                return Record.fromBase64(await comp.convert_to_base64())
+
         local_path = await comp.convert_to_file_path()
         if not local_path:
             return comp
@@ -52,14 +69,19 @@ async def _rebuild_media_component(comp):
         return Plain(text=f"[{comp_type}转发失败：源文件不可达]")
 
 
-async def _prepare_chain_for_forward(chain):
+async def _prepare_chain_for_forward(chain, freeze_for_delayed_send: bool = False):
     """转发前对消息链做「本地化」预处理，返回新的可安全跨会话发送的链。"""
     if not chain:
         return chain
     prepared = []
     for comp in chain:
         if isinstance(comp, (Image, Record, Video, File)):
-            prepared.append(await _rebuild_media_component(comp))
+            prepared.append(
+                await _rebuild_media_component(
+                    comp,
+                    freeze_for_delayed_send=freeze_for_delayed_send,
+                )
+            )
         else:
             prepared.append(comp)
     return prepared
@@ -148,7 +170,7 @@ class MsgForward(star.Star):
         super().__init__(context)
         self.config = config or {}
 
-        self.data_dir = star.StarTools.get_data_dir("msg_forward_cc")
+        self.data_dir = star.StarTools.get_data_dir("msg_forward_merge")
         self.pending_file = self.data_dir / "pending.json"
 
         self.store = MsgForwardStore(self.pending_file)
@@ -157,7 +179,7 @@ class MsgForward(star.Star):
         self._cooldowns: dict[str, float] = {}
 
         # 合并转发缓冲：每条规则独立缓存，首条消息到达后启动一个固定窗口计时器。
-        self._merge_buffers: dict[str, list[tuple[AstrMessageEvent, list[Any]]]] = {}
+        self._merge_buffers: dict[str, list[BufferedForward]] = {}
         self._merge_tasks: dict[str, asyncio.Task] = {}
         self._merge_lock: Optional[asyncio.Lock] = None
 
@@ -258,6 +280,62 @@ class MsgForward(star.Star):
         header += "\n\n\u200b"
         return [Plain(text=header), *message_chain]
 
+    @staticmethod
+    def _get_platform_id_from_umo(umo: str) -> str:
+        """从 UMO 中取出平台实例 ID。"""
+        return umo.split(":", 1)[0]
+
+    def _is_aiocqhttp_target(self, target_umo: str) -> bool:
+        """根据平台实例元数据判断目标是否为 OneBot V11 适配器。"""
+        platform_id = self._get_platform_id_from_umo(target_umo)
+        get_platform_inst = getattr(self.context, "get_platform_inst", None)
+        if callable(get_platform_inst):
+            try:
+                platform = get_platform_inst(platform_id)
+                if platform is not None:
+                    return getattr(platform.meta(), "name", None) == "aiocqhttp"
+            except Exception as e:
+                logger.warning(f"获取目标平台 {platform_id} 的元数据失败：{e}")
+
+        # 兼容没有 get_platform_inst 的旧版 AstrBot，以及标准 aiocqhttp 实例 ID 配置。
+        return platform_id == "aiocqhttp"
+
+    def _should_use_native_qq_forward(self, event: AstrMessageEvent, target_umo: str) -> bool:
+        """仅在 QQ OneBot → QQ OneBot 时使用原生合并转发节点。"""
+        return event.get_platform_name() == "aiocqhttp" and self._is_aiocqhttp_target(target_umo)
+
+    @staticmethod
+    def _build_fallback_merged_chain(pending_messages: list[BufferedForward]) -> list[Any]:
+        """构造跨平台通用的合并消息链。"""
+        merged_chain: list[Any] = []
+        for pending_message in pending_messages:
+            if merged_chain:
+                merged_chain.append(Plain(text="\n\n"))
+            merged_chain.extend(pending_message.fallback_chain)
+        return merged_chain
+
+    @staticmethod
+    def _build_native_qq_forward_nodes(
+        pending_messages: list[BufferedForward],
+    ) -> Optional[list[Node]]:
+        """将缓存消息转换为 OneBot 群合并转发节点。"""
+        nodes: list[Node] = []
+        for pending_message in pending_messages:
+            event = pending_message.event
+            sender_id = str(event.get_sender_id() or "").strip()
+            if not sender_id.isdigit():
+                return None
+
+            sender_name = str(event.get_sender_name() or sender_id)
+            nodes.append(
+                Node(
+                    uin=sender_id,
+                    name=sender_name,
+                    content=list(pending_message.node_content),
+                )
+            )
+        return nodes
+
     async def _queue_merged_forward(
         self,
         merge_key: str,
@@ -265,12 +343,20 @@ class MsgForward(star.Star):
         window_seconds: int,
         cooldown_key: str,
         cooldown_seconds: int,
+        use_native_qq_forward: bool,
         event: AstrMessageEvent,
-        message_chain: list[Any],
+        fallback_chain: list[Any],
+        node_content: list[Any],
     ) -> None:
         """缓存消息；同一规则的首条消息负责启动合并窗口。"""
         async with self._get_merge_lock():
-            self._merge_buffers.setdefault(merge_key, []).append((event, message_chain))
+            self._merge_buffers.setdefault(merge_key, []).append(
+                BufferedForward(
+                    event=event,
+                    fallback_chain=fallback_chain,
+                    node_content=node_content,
+                )
+            )
             task = self._merge_tasks.get(merge_key)
             if task is None or task.done():
                 self._merge_tasks[merge_key] = asyncio.create_task(
@@ -280,6 +366,7 @@ class MsgForward(star.Star):
                         window_seconds=window_seconds,
                         cooldown_key=cooldown_key,
                         cooldown_seconds=cooldown_seconds,
+                        use_native_qq_forward=use_native_qq_forward,
                     )
                 )
 
@@ -290,6 +377,7 @@ class MsgForward(star.Star):
         window_seconds: int,
         cooldown_key: str,
         cooldown_seconds: int,
+        use_native_qq_forward: bool,
     ) -> None:
         """在合并窗口结束后发送缓存内容；空缓存不会发送任何消息。"""
         try:
@@ -303,13 +391,17 @@ class MsgForward(star.Star):
             if not pending_messages:
                 return
 
-            merged_chain: list[Any] = []
-            for _, message_chain in pending_messages:
-                if merged_chain:
-                    merged_chain.append(Plain(text="\n\n"))
-                merged_chain.extend(message_chain)
+            if use_native_qq_forward:
+                nodes = self._build_native_qq_forward_nodes(pending_messages)
+                if nodes:
+                    merged_chain = [Nodes(nodes=nodes)]
+                else:
+                    logger.warning("QQ 原生合并转发缺少有效发送者 QQ 号，已回退为普通合并消息。")
+                    merged_chain = self._build_fallback_merged_chain(pending_messages)
+            else:
+                merged_chain = self._build_fallback_merged_chain(pending_messages)
 
-            first_event = pending_messages[0][0]
+            first_event = pending_messages[0].event
             await self.context.send_message(target, first_event.chain_result(merged_chain))
             if cooldown_seconds > 0:
                 self._cooldowns[cooldown_key] = time.time() + cooldown_seconds
@@ -352,7 +444,7 @@ class MsgForward(star.Star):
             "转发一次后在该时间内不会再次转发，避免刷屏。\n\n"
             "合并转发：在规则配置中开启 merge_forward_enabled，\n"
             "并设置 merge_forward_seconds。首条消息到达后会收集该秒数内的消息，\n"
-            "窗口结束时仅在有消息缓存时合并发送。"
+            "窗口结束时仅在有消息缓存时合并发送。QQ OneBot → QQ OneBot 会发送原生合并转发。"
         )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -747,12 +839,18 @@ class MsgForward(star.Star):
                 return
 
             raw_chain = event.get_messages() or []
-            # 合并转发会延迟发送，源事件结束后其临时媒体文件可能已被清理；此时强制本地化媒体。
-            should_prepare_media = self.config.get("download_media_before_send", False) or any(
+            # 合并转发会延迟发送，源事件结束后其临时媒体文件可能已被清理；图片和语音会立即固化为 Base64。
+            has_delayed_merge = any(
                 self._get_merge_forward_settings(rule)[0] for _, rule in matched_rules
             )
+            should_prepare_media = self.config.get("download_media_before_send", False) or has_delayed_merge
             if should_prepare_media:
-                message_chain = list(await _prepare_chain_for_forward(raw_chain))
+                message_chain = list(
+                    await _prepare_chain_for_forward(
+                        raw_chain,
+                        freeze_for_delayed_send=has_delayed_merge,
+                    )
+                )
             else:
                 message_chain = list(raw_chain)
             now = time.time()
@@ -779,14 +877,17 @@ class MsgForward(star.Star):
                     merge_enabled, merge_seconds = self._get_merge_forward_settings(rule)
                     if merge_enabled:
                         merge_key = f"{source_umo}|{target}|{rule_index}"
+                        use_native_qq_forward = self._should_use_native_qq_forward(event, target)
                         await self._queue_merged_forward(
                             merge_key=merge_key,
                             target=target,
                             window_seconds=merge_seconds,
                             cooldown_key=cooldown_key,
                             cooldown_seconds=cooldown_seconds,
+                            use_native_qq_forward=use_native_qq_forward,
                             event=event,
-                            message_chain=new_chain,
+                            fallback_chain=new_chain,
+                            node_content=list(message_chain),
                         )
                         continue
 

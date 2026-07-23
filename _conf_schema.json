@@ -57,7 +57,7 @@
           "merge_forward_enabled": {
             "description": "开启合并转发",
             "type": "bool",
-            "hint": "开启后，不再逐条立即发送；同一规则在合并窗口内收到的消息会合并成一条消息发送。",
+            "hint": "开启后，不再逐条立即发送；同一规则在合并窗口内收到的消息会合并成一条消息发送。源和目标的平台适配器类型均为 aiocqhttp（QQ OneBot）时，会自动发送 QQ 原生合并转发记录；实例 ID 可为 default 等自定义值。",
             "default": false
           },
           "merge_forward_seconds": {
