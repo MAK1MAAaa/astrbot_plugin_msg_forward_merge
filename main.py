@@ -1,8 +1,10 @@
+import asyncio
 import json
 import re
 import secrets
 import time
 from pathlib import Path
+from typing import Any, Optional
 
 import astrbot.api.star as star
 from astrbot.api.event import filter, AstrMessageEvent
@@ -154,6 +156,11 @@ class MsgForward(star.Star):
         # 冷却计时器：key = "source_umo|target_umo"，value = 冷却结束时间戳
         self._cooldowns: dict[str, float] = {}
 
+        # 合并转发缓冲：每条规则独立缓存，首条消息到达后启动一个固定窗口计时器。
+        self._merge_buffers: dict[str, list[tuple[AstrMessageEvent, list[Any]]]] = {}
+        self._merge_tasks: dict[str, asyncio.Task] = {}
+        self._merge_lock: Optional[asyncio.Lock] = None
+
     def _format_origin_header(self, event: AstrMessageEvent, umo: str) -> str:
         try:
             _, msg_type, conversation_id = umo.split(":", 2)
@@ -206,6 +213,117 @@ class MsgForward(star.Star):
     async def initialize(self):
         logger.info("MsgForward plugin init OK")
 
+    @staticmethod
+    def _to_non_negative_int(value: Any, default: int = 0) -> int:
+        """将配置值安全地转换为非负整数。"""
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return default
+
+    def _get_merge_lock(self) -> asyncio.Lock:
+        """在运行中的事件循环内延迟创建锁，兼容插件初始化发生在其他线程的情况。"""
+        if self._merge_lock is None:
+            self._merge_lock = asyncio.Lock()
+        return self._merge_lock
+
+    def _get_cooldown_seconds(self, rule: dict) -> int:
+        """获取规则实际生效的冷却时间。"""
+        cooldown_seconds = rule.get("cooldown_seconds")
+        if cooldown_seconds is None:
+            cooldown_seconds = self.config.get("default_cooldown_seconds", 0)
+        return self._to_non_negative_int(cooldown_seconds)
+
+    def _get_merge_forward_settings(self, rule: dict) -> tuple[bool, int]:
+        """获取规则的合并转发开关和时间窗口。"""
+        enabled = bool(rule.get("merge_forward_enabled", False))
+        window_seconds = self._to_non_negative_int(
+            rule.get("merge_forward_seconds", 10),
+            default=10,
+        )
+        return enabled and window_seconds > 0, window_seconds
+
+    def _build_forward_chain(
+        self,
+        event: AstrMessageEvent,
+        source_umo: str,
+        rule: dict,
+        message_chain: list[Any],
+    ) -> list[Any]:
+        """构造单条消息的最终转发链，合并模式下也复用该格式。"""
+        if rule.get("hide_header", False):
+            return list(message_chain)
+
+        header = self._format_origin_header(event, source_umo)
+        header += "\n\n\u200b"
+        return [Plain(text=header), *message_chain]
+
+    async def _queue_merged_forward(
+        self,
+        merge_key: str,
+        target: str,
+        window_seconds: int,
+        cooldown_key: str,
+        cooldown_seconds: int,
+        event: AstrMessageEvent,
+        message_chain: list[Any],
+    ) -> None:
+        """缓存消息；同一规则的首条消息负责启动合并窗口。"""
+        async with self._get_merge_lock():
+            self._merge_buffers.setdefault(merge_key, []).append((event, message_chain))
+            task = self._merge_tasks.get(merge_key)
+            if task is None or task.done():
+                self._merge_tasks[merge_key] = asyncio.create_task(
+                    self._flush_merged_forward(
+                        merge_key=merge_key,
+                        target=target,
+                        window_seconds=window_seconds,
+                        cooldown_key=cooldown_key,
+                        cooldown_seconds=cooldown_seconds,
+                    )
+                )
+
+    async def _flush_merged_forward(
+        self,
+        merge_key: str,
+        target: str,
+        window_seconds: int,
+        cooldown_key: str,
+        cooldown_seconds: int,
+    ) -> None:
+        """在合并窗口结束后发送缓存内容；空缓存不会发送任何消息。"""
+        try:
+            await asyncio.sleep(window_seconds)
+
+            async with self._get_merge_lock():
+                pending_messages = self._merge_buffers.pop(merge_key, [])
+                if self._merge_tasks.get(merge_key) is asyncio.current_task():
+                    self._merge_tasks.pop(merge_key, None)
+
+            if not pending_messages:
+                return
+
+            merged_chain: list[Any] = []
+            for _, message_chain in pending_messages:
+                if merged_chain:
+                    merged_chain.append(Plain(text="\n\n"))
+                merged_chain.extend(message_chain)
+
+            first_event = pending_messages[0][0]
+            await self.context.send_message(target, first_event.chain_result(merged_chain))
+            if cooldown_seconds > 0:
+                self._cooldowns[cooldown_key] = time.time() + cooldown_seconds
+        except asyncio.CancelledError:
+            raise
+        except ValueError as e:
+            logger.error(f"❌ 不合法的 session 字符串，合并转发失败: {e}")
+        except Exception as e:
+            logger.error(f"❌ 合并转发失败: {e}")
+        finally:
+            async with self._get_merge_lock():
+                if self._merge_tasks.get(merge_key) is asyncio.current_task():
+                    self._merge_tasks.pop(merge_key, None)
+
     @filter.command_group("mf")
     def mf(self):
         """mf 命令组"""
@@ -228,10 +346,13 @@ class MsgForward(star.Star):
             "#mf hide <编号>   切换规则来源信息显示/隐藏\n"
             "#mf hidelist      列出当前会话规则的来源信息状态\n"
             "#mf hidelistall   列出所有规则的来源信息状态\n"
-            "#mf filter        查看当前过滤与冷却配置\n"
+            "#mf filter        查看当前过滤、冷却与合并转发配置\n"
             "#mf help          显示此帮助\n\n"
             "冷却转发：在规则配置中设置 cooldown_seconds > 0\n"
-            "转发一次后在该时间内不会再次转发，避免刷屏。"
+            "转发一次后在该时间内不会再次转发，避免刷屏。\n\n"
+            "合并转发：在规则配置中开启 merge_forward_enabled，\n"
+            "并设置 merge_forward_seconds。首条消息到达后会收集该秒数内的消息，\n"
+            "窗口结束时仅在有消息缓存时合并发送。"
         )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -262,6 +383,8 @@ class MsgForward(star.Star):
                 "source_umo": source_umo,
                 "target_umo": target_umo,
                 "hide_header": hide_header,
+                "merge_forward_enabled": False,
+                "merge_forward_seconds": 10,
             })
             self.config["rules"] = rules
             self.config.save_config()
@@ -330,6 +453,8 @@ class MsgForward(star.Star):
                 "source_umo": source_umo,
                 "target_umo": target_umo,
                 "hide_header": hide_header,
+                "merge_forward_enabled": False,
+                "merge_forward_seconds": 10,
             })
             self.config["rules"] = rules
             self.config.save_config()
@@ -371,9 +496,13 @@ class MsgForward(star.Star):
         lines = [f"📜 当前会话({source_umo}) 的规则："]
         for idx, r in matched:
             hide_status = "🔒" if r.get("hide_header", False) else "🔓"
-            cd = r.get("cooldown_seconds") or self.config.get("default_cooldown_seconds", 0)
-            cd_str = f"❄{cd}s" if int(cd) > 0 else ""
-            lines.append(f"#{idx} {r['source_umo']} → {r['target_umo']} {hide_status} {cd_str}".strip())
+            cooldown_seconds = self._get_cooldown_seconds(r)
+            cooldown_text = f"❄{cooldown_seconds}s" if cooldown_seconds > 0 else ""
+            merge_enabled, merge_seconds = self._get_merge_forward_settings(r)
+            merge_text = f"合并{merge_seconds}s" if merge_enabled else ""
+            lines.append(
+                f"#{idx} {r['source_umo']} → {r['target_umo']} {hide_status} {cooldown_text} {merge_text}".strip()
+            )
         yield event.plain_result("\n".join(lines))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -465,10 +594,13 @@ class MsgForward(star.Star):
         lines = ["📜 所有转发规则："]
         for idx, r in enumerate(rules, start=1):
             hide_status = "🔒" if r.get("hide_header", False) else "🔓"
-            cd = r.get("cooldown_seconds") or self.config.get("default_cooldown_seconds", 0)
-            cd_str = f"❄{cd}s" if int(cd) > 0 else ""
+            cooldown_seconds = self._get_cooldown_seconds(r)
+            cooldown_text = f"❄{cooldown_seconds}s" if cooldown_seconds > 0 else ""
+            merge_enabled, merge_seconds = self._get_merge_forward_settings(r)
+            merge_text = f"合并{merge_seconds}s" if merge_enabled else ""
             lines.append(
-                f"#{idx} {r.get('source_umo', '?')} → {r.get('target_umo', '?')} {hide_status} {cd_str}".strip()
+                f"#{idx} {r.get('source_umo', '?')} → {r.get('target_umo', '?')} "
+                f"{hide_status} {cooldown_text} {merge_text}".strip()
             )
         yield event.plain_result("\n".join(lines))
 
@@ -513,15 +645,32 @@ class MsgForward(star.Star):
             lines.append("（所有规则使用全局过滤配置）")
 
         # 显示冷却配置
-        default_cd = self.config.get("default_cooldown_seconds", 0)
-        cd_desc = f"{default_cd}s" if int(default_cd) > 0 else "关闭"
+        default_cd = self._to_non_negative_int(self.config.get("default_cooldown_seconds", 0))
+        cd_desc = f"{default_cd}s" if default_cd > 0 else "关闭"
         lines.append(f"\n📋 转发冷却：全局默认 ❄{cd_desc}")
         for idx, r in enumerate(rules, start=1):
             cd = r.get("cooldown_seconds")
-            if cd is not None and int(cd) > 0:
-                lines.append(f"  #{idx} | {r.get('source_umo','?')} → {r.get('target_umo','?')} | ❄{cd}s")
-            elif cd is not None and int(cd) == 0:
+            if cd is not None and self._to_non_negative_int(cd) > 0:
+                lines.append(
+                    f"  #{idx} | {r.get('source_umo','?')} → {r.get('target_umo','?')} | "
+                    f"❄{self._to_non_negative_int(cd)}s"
+                )
+            elif cd is not None and self._to_non_negative_int(cd) == 0:
                 lines.append(f"  #{idx} | {r.get('source_umo','?')} → {r.get('target_umo','?')} | ❄关闭")
+
+        # 显示合并转发配置
+        lines.append("\n📋 合并转发：")
+        has_merge_rule = False
+        for idx, r in enumerate(rules, start=1):
+            merge_enabled, merge_seconds = self._get_merge_forward_settings(r)
+            if merge_enabled:
+                has_merge_rule = True
+                lines.append(
+                    f"  #{idx} | {r.get('source_umo','?')} → {r.get('target_umo','?')} | "
+                    f"开启，窗口 {merge_seconds}s"
+                )
+        if not has_merge_rule:
+            lines.append("（所有规则均未开启）")
 
         yield event.plain_result("\n".join(lines))
 
@@ -589,19 +738,26 @@ class MsgForward(star.Star):
         """主转发逻辑"""
         try:
             source_umo = str(event.unified_msg_origin)
-            rules = [r for r in self.config.get("rules", []) if r.get("source_umo") == source_umo]
-            if not rules:
+            matched_rules = [
+                (rule_index, rule)
+                for rule_index, rule in enumerate(self.config.get("rules", []), start=1)
+                if rule.get("source_umo") == source_umo
+            ]
+            if not matched_rules:
                 return
 
-            raw_chain = event.get_messages()
-            # 跨设备转发时媒体组件的 file 路径常不可达，启用此选项会先下载到本机再转发。
-            if self.config.get("download_media_before_send", False):
-                message_chain = await _prepare_chain_for_forward(raw_chain)
+            raw_chain = event.get_messages() or []
+            # 合并转发会延迟发送，源事件结束后其临时媒体文件可能已被清理；此时强制本地化媒体。
+            should_prepare_media = self.config.get("download_media_before_send", False) or any(
+                self._get_merge_forward_settings(rule)[0] for _, rule in matched_rules
+            )
+            if should_prepare_media:
+                message_chain = list(await _prepare_chain_for_forward(raw_chain))
             else:
-                message_chain = raw_chain
+                message_chain = list(raw_chain)
             now = time.time()
 
-            for idx, rule in enumerate(rules):
+            for rule_index, rule in matched_rules:
                 target = rule.get("target_umo")
                 if not target:
                     continue
@@ -610,28 +766,34 @@ class MsgForward(star.Star):
                     continue
 
                 # 冷却检查
-                cooldown_sec = rule.get("cooldown_seconds")
-                if cooldown_sec is None:
-                    cooldown_sec = self.config.get("default_cooldown_seconds", 0)
-                cooldown_sec = int(cooldown_sec) if cooldown_sec else 0
+                cooldown_seconds = self._get_cooldown_seconds(rule)
+                cooldown_key = f"{source_umo}|{target}"
 
-                if cooldown_sec > 0:
-                    cd_key = f"{source_umo}|{target}"
-                    cd_end = self._cooldowns.get(cd_key, 0)
+                if cooldown_seconds > 0:
+                    cd_end = self._cooldowns.get(cooldown_key, 0)
                     if now < cd_end:
                         continue
 
                 try:
-                    if rule.get("hide_header", False):
-                        new_chain = message_chain
-                    else:
-                        header = self._format_origin_header(event, source_umo)
-                        header += "\n\n\u200b"
-                        new_chain = [Plain(text=header)] + message_chain
+                    new_chain = self._build_forward_chain(event, source_umo, rule, message_chain)
+                    merge_enabled, merge_seconds = self._get_merge_forward_settings(rule)
+                    if merge_enabled:
+                        merge_key = f"{source_umo}|{target}|{rule_index}"
+                        await self._queue_merged_forward(
+                            merge_key=merge_key,
+                            target=target,
+                            window_seconds=merge_seconds,
+                            cooldown_key=cooldown_key,
+                            cooldown_seconds=cooldown_seconds,
+                            event=event,
+                            message_chain=new_chain,
+                        )
+                        continue
+
                     await self.context.send_message(target, event.chain_result(new_chain))
                     # 转发成功后设置冷却
-                    if cooldown_sec > 0:
-                        self._cooldowns[cd_key] = now + cooldown_sec
+                    if cooldown_seconds > 0:
+                        self._cooldowns[cooldown_key] = now + cooldown_seconds
                 except ValueError as e:
                     logger.error(f"❌ 不合法的 session 字符串，转发失败: {e}")
                 except Exception as e:
@@ -641,4 +803,14 @@ class MsgForward(star.Star):
             logger.error(f"❌ 转发逻辑异常: {e}")
 
     async def terminate(self):
+        async with self._get_merge_lock():
+            merge_tasks = list(self._merge_tasks.values())
+            self._merge_tasks.clear()
+            self._merge_buffers.clear()
+
+        for task in merge_tasks:
+            task.cancel()
+        if merge_tasks:
+            await asyncio.gather(*merge_tasks, return_exceptions=True)
+
         logger.info("MsgForward plugin terminated")

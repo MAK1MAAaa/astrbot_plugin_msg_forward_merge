@@ -53,6 +53,18 @@
             "type": "int",
             "hint": "仅对本规则生效。转发一次后在该秒数内不再重复转发。0 或不填则继承全局默认值。",
             "default": 0
+          },
+          "merge_forward_enabled": {
+            "description": "开启合并转发",
+            "type": "bool",
+            "hint": "开启后，不再逐条立即发送；同一规则在合并窗口内收到的消息会合并成一条消息发送。",
+            "default": false
+          },
+          "merge_forward_seconds": {
+            "description": "合并转发窗口（秒）",
+            "type": "int",
+            "hint": "仅在开启合并转发时生效。首条待转发消息到达后开始计时，窗口结束时只在缓存中有消息时发送；未收到消息不会发送空消息。必须大于 0。",
+            "default": 10
           }
         }
       }
